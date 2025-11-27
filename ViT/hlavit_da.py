@@ -1,0 +1,490 @@
+import os
+import random
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+
+
+DATA_ROOT = "./data"
+SRC_DOMAIN = "adult"
+TGT_DOMAIN = "infant"
+
+IMG_SIZE = 224
+BATCH_SIZE = 32
+LR = 1e-4
+EPOCHS = 20
+LAMBDA_DA = 1.0
+
+if torch.backends.mps.is_available():
+    DEVICE = "mps"
+elif torch.cuda.is_available():
+    DEVICE = "cuda"
+else:
+    DEVICE = "cpu"
+
+NUM_WORKERS = 0
+CHECKPOINT = "hlavit_DANN_adult2infant.pth"
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+class PatchEmbedding(nn.Module):
+    def __init__(self, in_channels=3, embed_dim=256, patch_size=16):
+        super().__init__()
+        self.patch_size = patch_size
+        self.proj = nn.Conv2d(
+            in_channels,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+
+    def forward(self, x):
+        x = self.proj(x)
+        return x
+
+
+class TransformerEncoderBlock(nn.Module):
+    def __init__(self, embed_dim, num_heads, mlp_ratio=4.0, drop=0.0, attn_drop=0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=attn_drop,
+            batch_first=True, 
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+
+        hidden_dim = int(embed_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.Linear(hidden_dim, embed_dim),
+            nn.Dropout(drop),
+        )
+
+    def forward(self, x):
+        x_norm = self.norm1(x)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        x = x + attn_out
+
+        x_norm = self.norm2(x)
+        x = x + self.mlp(x_norm)
+        return x
+
+
+class AttentivePooling(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.attn_vector = nn.Parameter(torch.randn(embed_dim))
+
+    def forward(self, x):
+        B, N, D = x.shape
+        q = self.attn_vector.unsqueeze(0).unsqueeze(1)  
+        q = q.expand(B, 1, D)                          
+
+        scores = torch.bmm(q, x.transpose(1, 2)) / (D ** 0.5) 
+        attn_weights = F.softmax(scores, dim=-1)              
+
+        pooled = torch.bmm(attn_weights, x)  
+        pooled = pooled.squeeze(1)          
+        return pooled
+
+
+class HLAViT(nn.Module):
+    def __init__(
+        self,
+        image_size=224,
+        patch_size=16,
+        in_channels=3,
+        num_classes=4,
+        embed_dim=256,
+        depth_global=4,
+        depth_local=4,
+        num_heads=8,
+        mlp_ratio=4.0,
+        drop=0.0,
+        attn_drop=0.0,
+        local_pool_factor=2, 
+    ):
+        super().__init__()
+
+        assert image_size % patch_size == 0, "image_size must be divisible by patch_size"
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.local_pool_factor = local_pool_factor
+
+        grid_size = image_size // patch_size 
+        self.grid_size = grid_size
+
+        num_patches_global = grid_size * grid_size
+
+        assert grid_size % local_pool_factor == 0, \
+            "grid_size must be divisible by local_pool_factor"
+        local_grid = grid_size // local_pool_factor
+        num_patches_local = local_grid * local_grid
+
+        self.patch_embed = PatchEmbedding(
+            in_channels=in_channels,
+            embed_dim=embed_dim,
+            patch_size=patch_size,
+        )
+
+        self.pos_embed_global = nn.Parameter(torch.zeros(1, num_patches_global, embed_dim))
+        self.pos_embed_local = nn.Parameter(torch.zeros(1, num_patches_local, embed_dim))
+        nn.init.trunc_normal_(self.pos_embed_global, std=0.02)
+        nn.init.trunc_normal_(self.pos_embed_local, std=0.02)
+
+        self.global_blocks = nn.ModuleList([
+            TransformerEncoderBlock(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                drop=drop,
+                attn_drop=attn_drop,
+            )
+            for _ in range(depth_global)
+        ])
+        self.global_norm = nn.LayerNorm(embed_dim)
+        self.global_pool = AttentivePooling(embed_dim)
+
+        self.local_blocks = nn.ModuleList([
+            TransformerEncoderBlock(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                drop=drop,
+                attn_drop=attn_drop,
+            )
+            for _ in range(depth_local)
+        ])
+        self.local_norm = nn.LayerNorm(embed_dim)
+        self.local_pool = AttentivePooling(embed_dim)
+
+        self.fused_dim = embed_dim * 2
+
+        self.head = nn.Linear(self.fused_dim, num_classes)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.ones_(m.weight)
+            nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def _global_tokens(self, feat_map):
+        B, D, H_, W_ = feat_map.shape
+        x = feat_map.view(B, D, H_ * W_)  
+        x = x.transpose(1, 2)             
+        x = x + self.pos_embed_global
+        return x
+
+    def _local_tokens(self, feat_map):
+        B, D, H_, W_ = feat_map.shape
+        f = self.local_pool_factor
+        pooled = F.avg_pool2d(
+            feat_map,
+            kernel_size=f,
+            stride=f,
+        )
+
+        _, _, H_l, W_l = pooled.shape
+        x = pooled.view(B, D, H_l * W_l) 
+        x = x.transpose(1, 2)            
+        x = x + self.pos_embed_local
+        return x
+
+    def forward_features(self, x):
+        feat_map = self.patch_embed(x) 
+
+        g_tokens = self._global_tokens(feat_map) 
+        for blk in self.global_blocks:
+            g_tokens = blk(g_tokens)
+        g_tokens = self.global_norm(g_tokens)
+        g_feat = self.global_pool(g_tokens)    
+
+        # local branch
+        l_tokens = self._local_tokens(feat_map)
+        for blk in self.local_blocks:
+            l_tokens = blk(l_tokens)
+        l_tokens = self.local_norm(l_tokens)
+        l_feat = self.local_pool(l_tokens) 
+
+        fused = torch.cat([g_feat, l_feat], dim=1)
+        return fused
+
+    def forward(self, x):
+        fused = self.forward_features(x)
+        logits = self.head(fused)
+        return logits
+
+
+class GradReverse(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.alpha, None
+
+
+def grad_reverse(x, alpha=1.0):
+    return GradReverse.apply(x, alpha)
+
+
+class DomainDiscriminator(nn.Module):
+    def __init__(self, in_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 2),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def compute_accuracy(logits, labels):
+    preds = torch.argmax(logits, dim=1)
+    correct = (preds == labels).float().sum()
+    return correct / labels.size(0)
+
+
+def dann_alpha(epoch, total_epochs, batch_idx, num_batches):
+    p = float(epoch - 1 + batch_idx / num_batches) / float(total_epochs)
+    return 2.0 / (1.0 + np.exp(-10 * p)) - 1.0
+
+
+def main():
+    set_seed(42)
+    print(f"Using device: {DEVICE}")
+
+    train_transform = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5],
+                             std=[0.5, 0.5, 0.5]),
+    ])
+
+    val_transform = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5],
+                             std=[0.5, 0.5, 0.5]),
+    ])
+
+    src_train_dir = os.path.join(DATA_ROOT, SRC_DOMAIN, "train")
+    tgt_train_dir = os.path.join(DATA_ROOT, TGT_DOMAIN, "train")
+    tgt_val_dir = os.path.join(DATA_ROOT, TGT_DOMAIN, "val")
+
+    src_train_dataset = datasets.ImageFolder(root=src_train_dir,
+                                             transform=train_transform)
+    tgt_train_dataset = datasets.ImageFolder(root=tgt_train_dir,
+                                             transform=train_transform)
+    tgt_val_dataset = datasets.ImageFolder(root=tgt_val_dir,
+                                           transform=val_transform)
+
+    print("Source classes (adult):", src_train_dataset.classes)
+    print("Target classes (infant):", tgt_train_dataset.classes)
+
+    if src_train_dataset.classes != tgt_train_dataset.classes:
+        print("Warning: source and target class names differ. "
+              "Label mapping might be inconsistent.")
+
+    pin_memory = (DEVICE == "cuda")
+
+    src_train_loader = DataLoader(
+        src_train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=pin_memory,
+    )
+
+    tgt_train_loader = DataLoader(
+        tgt_train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=pin_memory,
+    )
+
+    tgt_val_loader = DataLoader(
+        tgt_val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=pin_memory,
+    )
+
+    num_classes = len(src_train_dataset.classes)
+
+    feature_extractor = HLAViT(
+        image_size=IMG_SIZE,
+        patch_size=16,
+        in_channels=3,
+        num_classes=num_classes,
+        embed_dim=256,
+        depth_global=4,
+        depth_local=4,
+        num_heads=8,
+        mlp_ratio=4.0,
+        drop=0.1,
+        attn_drop=0.1,
+        local_pool_factor=2,
+    ).to(DEVICE)
+
+    domain_discriminator = DomainDiscriminator(in_dim=feature_extractor.fused_dim).to(DEVICE)
+
+    cls_criterion = nn.CrossEntropyLoss()
+    dom_criterion = nn.CrossEntropyLoss()
+
+    optimizer = torch.optim.AdamW(
+        list(feature_extractor.parameters()) + list(domain_discriminator.parameters()),
+        lr=LR,
+    )
+
+    best_val_acc = 0.0
+
+    src_iter_len = len(src_train_loader)
+    tgt_iter_len = len(tgt_train_loader)
+    num_batches = min(src_iter_len, tgt_iter_len)
+
+    for epoch in range(1, EPOCHS + 1):
+        feature_extractor.train()
+        domain_discriminator.train()
+
+        train_cls_loss = 0.0
+        train_dom_loss = 0.0
+        train_cls_acc = 0.0
+
+        src_iter = iter(src_train_loader)
+        tgt_iter = iter(tgt_train_loader)
+
+        for batch_idx in tqdm(range(num_batches),
+                              desc=f"Epoch {epoch} [Train]",
+                              leave=False):
+            try:
+                src_images, src_labels = next(src_iter)
+            except StopIteration:
+                src_iter = iter(src_train_loader)
+                src_images, src_labels = next(src_iter)
+
+            try:
+                tgt_images, _ = next(tgt_iter)
+            except StopIteration:
+                tgt_iter = iter(tgt_train_loader)
+                tgt_images, _ = next(tgt_iter)
+
+            src_images = src_images.to(DEVICE)
+            src_labels = src_labels.to(DEVICE)
+            tgt_images = tgt_images.to(DEVICE)
+
+            optimizer.zero_grad()
+
+            src_features = feature_extractor.forward_features(src_images)
+            src_logits = feature_extractor.head(src_features)
+            cls_loss = cls_criterion(src_logits, src_labels)
+            cls_acc = compute_accuracy(src_logits, src_labels)
+
+            tgt_features = feature_extractor.forward_features(tgt_images)
+            features_all = torch.cat([src_features, tgt_features], dim=0)
+
+            alpha = dann_alpha(epoch, EPOCHS, batch_idx, num_batches)
+            features_rev = grad_reverse(features_all, alpha)
+
+            dom_logits = domain_discriminator(features_rev)
+
+            dom_labels_src = torch.zeros(src_features.size(0), dtype=torch.long, device=DEVICE)
+            dom_labels_tgt = torch.ones(tgt_features.size(0), dtype=torch.long, device=DEVICE)
+            dom_labels_all = torch.cat([dom_labels_src, dom_labels_tgt], dim=0)
+
+            dom_loss = dom_criterion(dom_logits, dom_labels_all)
+
+            loss = cls_loss + LAMBDA_DA * dom_loss
+            loss.backward()
+            optimizer.step()
+
+            train_cls_loss += cls_loss.item()
+            train_dom_loss += dom_loss.item()
+            train_cls_acc += cls_acc.item()
+
+        train_cls_loss /= num_batches
+        train_dom_loss /= num_batches
+        train_cls_acc /= num_batches
+
+        feature_extractor.eval()
+        val_loss = 0.0
+        val_acc = 0.0
+
+        with torch.no_grad():
+            for images, labels in tqdm(tgt_val_loader,
+                                       desc=f"Epoch {epoch} [Val - Target]",
+                                       leave=False):
+                images = images.to(DEVICE)
+                labels = labels.to(DEVICE)
+
+                logits = feature_extractor(images)
+                loss = cls_criterion(logits, labels)
+                acc = compute_accuracy(logits, labels)
+
+                val_loss += loss.item()
+                val_acc += acc.item()
+
+        val_loss /= len(tgt_val_loader)
+        val_acc /= len(tgt_val_loader)
+
+        print(f"""
+        ==========================
+        Epoch {epoch}/{EPOCHS}
+        Train Src Cls Loss: {train_cls_loss:.4f}
+        Train Dom Loss:     {train_dom_loss:.4f}
+        Train Src Cls Acc:  {train_cls_acc:.4f}
+        Val (Target) Loss:  {val_loss:.4f}
+        Val (Target) Acc:   {val_acc:.4f}
+        ==========================
+        """)
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save({
+                "feature_extractor": feature_extractor.state_dict(),
+                "domain_discriminator": domain_discriminator.state_dict(),
+                "val_acc": best_val_acc,
+                "epoch": epoch,
+            }, CHECKPOINT)
+            print(f"Saved new best model to {CHECKPOINT} "
+                  f"(Val Target Acc: {val_acc:.4f})")
+
+    print("Training complete.")
+    print(f"Best target-val accuracy: {best_val_acc:.4f}")
+
+
+if __name__ == "__main__":
+    main()
