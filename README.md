@@ -2,13 +2,10 @@
 
 *Code and experiments for evaluating deep learning models on infant facial expressions.*
 
-The project focuses on:
+### The project focuses on:
 	- Evaluating CNNs (VGG-16, ResNet-18) and Vision Transformers (ViT-B/16, APViT, HLA-ViT)
-	
 	- Classifying four infant facial expression categories: angry, cry, laugh, normal
-	
 	- Measuring cross-domain generalization from adult → infant expressions
-	
 	- Applying Domain-Adversarial Neural Networks (DANN) to reduce developmental domain gaps
 	
 
